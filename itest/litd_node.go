@@ -3,6 +3,8 @@ package itest
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,6 +22,9 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/go-errors/errors"
+	"github.com/lightninglabs/faraday/frdrpc"
+	"github.com/lightninglabs/loop/looprpc"
+	"github.com/lightninglabs/pool/poolrpc"
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
@@ -74,6 +79,12 @@ func generateListeningPorts(cfg *NodeConfig) {
 	if cfg.ProfilePort == 0 {
 		cfg.ProfilePort = lntest.NextAvailablePort()
 	}
+	if cfg.LitPort == 0 {
+		cfg.LitPort = lntest.NextAvailablePort()
+	}
+	if cfg.LitRESTPort == 0 {
+		cfg.LitRESTPort = lntest.NextAvailablePort()
+	}
 }
 
 type NodeConfig struct {
@@ -87,6 +98,7 @@ type NodeConfig struct {
 	NetParams  *chaincfg.Params
 	BaseDir    string
 	ExtraArgs  []string
+	LitArgs    []string
 
 	DataDir        string
 	LogDir         string
@@ -95,6 +107,15 @@ type NodeConfig struct {
 	AdminMacPath   string
 	ReadMacPath    string
 	InvoiceMacPath string
+	FaradayMacPath string
+	LoopMacPath    string
+	PoolMacPath    string
+
+	UIPassword string
+	LitDir     string
+	FaradayDir string
+	LoopDir    string
+	PoolDir    string
 
 	HasSeed  bool
 	Password []byte
@@ -125,6 +146,14 @@ func (cfg NodeConfig) RESTAddr() string {
 	return fmt.Sprintf(listenerFormat, cfg.RESTPort)
 }
 
+func (cfg NodeConfig) LitAddr() string {
+	return fmt.Sprintf(listenerFormat, cfg.LitPort)
+}
+
+func (cfg NodeConfig) LitRESTAddr() string {
+	return fmt.Sprintf(listenerFormat, cfg.LitRESTPort)
+}
+
 // DBDir returns the holding directory path of the graph database.
 func (cfg NodeConfig) DBDir() string {
 	return filepath.Join(cfg.DataDir, "graph", cfg.NetParams.Name)
@@ -149,15 +178,29 @@ func (cfg NodeConfig) ChanBackupPath() string {
 func (cfg NodeConfig) genArgs() []string {
 	var (
 		lndArgs []string
+		litArgs = []string{
+			fmt.Sprintf("--httpslisten=%s", cfg.LitAddr()),
+			fmt.Sprintf("--insecure-httplisten=%s", cfg.LitRESTAddr()),
+			fmt.Sprintf("--lit-dir=%s", cfg.LitDir),
+			fmt.Sprintf("--faraday.faradaydir=%s", cfg.FaradayDir),
+			fmt.Sprintf("--loop.loopdir=%s", cfg.LoopDir),
+			fmt.Sprintf("--pool.basedir=%s", cfg.PoolDir),
+			fmt.Sprintf("--uipassword=%s", cfg.UIPassword),
+			"--restcors=*",
+			"--lnd-mode=integrated",
+		}
 	)
 
 	switch cfg.NetParams {
 	case &chaincfg.TestNet3Params:
 		lndArgs = append(lndArgs, "--bitcoin.testnet")
+		litArgs = append(litArgs, "--network=testnet")
 	case &chaincfg.SimNetParams:
 		lndArgs = append(lndArgs, "--bitcoin.simnet")
+		litArgs = append(litArgs, "--network=simnet")
 	case &chaincfg.RegressionNetParams:
 		lndArgs = append(lndArgs, "--bitcoin.regtest")
+		litArgs = append(litArgs, "--network=regtest")
 	}
 
 	backendArgs := cfg.BackendCfg.GenArgs()
@@ -205,7 +248,17 @@ func (cfg NodeConfig) genArgs() []string {
 		lndArgs = append(lndArgs, "--feeurl="+cfg.FeeURL)
 	}
 
-	return lndArgs
+	// All arguments so far were for lnd. Let's namespace them now so we can
+	// add args for the other daemons and LiT itself afterwards.
+	litArgs = append(litArgs, cfg.LitArgs...)
+	for idx := range lndArgs {
+		litArgs = append(
+			litArgs,
+			strings.ReplaceAll(lndArgs[idx], "--", "--lnd."),
+		)
+	}
+
+	return litArgs
 }
 
 // policyUpdateMap defines a type to store channel policy updates. It has the
@@ -306,6 +359,10 @@ func newNode(cfg NodeConfig) (*HarnessNode, error) {
 	}
 	cfg.DataDir = filepath.Join(cfg.BaseDir, "data")
 	cfg.LogDir = filepath.Join(cfg.BaseDir, "log")
+	cfg.LitDir = filepath.Join(cfg.BaseDir, "lit")
+	cfg.FaradayDir = filepath.Join(cfg.LitDir, "faraday")
+	cfg.LoopDir = filepath.Join(cfg.LitDir, "loop")
+	cfg.PoolDir = filepath.Join(cfg.LitDir, "pool")
 	cfg.TLSCertPath = filepath.Join(cfg.DataDir, "tls.cert")
 	cfg.TLSKeyPath = filepath.Join(cfg.DataDir, "tls.key")
 
@@ -315,7 +372,22 @@ func newNode(cfg NodeConfig) (*HarnessNode, error) {
 	cfg.AdminMacPath = filepath.Join(networkDir, "admin.macaroon")
 	cfg.ReadMacPath = filepath.Join(networkDir, "readonly.macaroon")
 	cfg.InvoiceMacPath = filepath.Join(networkDir, "invoice.macaroon")
+	cfg.FaradayMacPath = filepath.Join(
+		cfg.FaradayDir, cfg.NetParams.Name, "faraday.macaroon",
+	)
+	cfg.LoopMacPath = filepath.Join(
+		cfg.LoopDir, cfg.NetParams.Name, "loop.macaroon",
+	)
+	cfg.PoolMacPath = filepath.Join(
+		cfg.PoolDir, cfg.NetParams.Name, "pool.macaroon",
+	)
 	generateListeningPorts(&cfg)
+
+	// Generate a random UI password by reading 16 random bytes and base64
+	// encoding them.
+	var randomBytes [16]byte
+	_, _ = rand.Read(randomBytes[:])
+	cfg.UIPassword = base64.URLEncoding.EncodeToString(randomBytes[:])
 
 	// Run all tests with accept keysend. The keysend code is very isolated
 	// and it is highly unlikely that it would affect regular itests when
@@ -601,7 +673,87 @@ func (hn *HarnessNode) WaitUntilStarted(conn grpc.ClientConnInterface,
 		return err
 	}
 
-	return nil
+	ctxt, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return wait.NoError(func() error {
+		faradayClient, err := hn.faradayClient()
+		if err != nil {
+			return err
+		}
+
+		_, err = faradayClient.RevenueReport(
+			ctxt, &frdrpc.RevenueReportRequest{},
+		)
+		if err != nil {
+			return err
+		}
+
+		loopClient, err := hn.loopClient()
+		if err != nil {
+			return err
+		}
+
+		_, err = loopClient.ListSwaps(ctxt, &looprpc.ListSwapsRequest{})
+		if err != nil {
+			return err
+		}
+
+		poolClient, err := hn.poolClient()
+		if err != nil {
+			return err
+		}
+
+		_, err = poolClient.GetInfo(ctxt, &poolrpc.GetInfoRequest{})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}, timeout)
+}
+
+func (hn *HarnessNode) faradayClient() (frdrpc.FaradayServerClient, error) {
+	mac, err := hn.ReadMacaroon(
+		hn.Cfg.FaradayMacPath, lntest.DefaultTimeout,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := hn.ConnectRPCWithMacaroon(mac)
+	if err != nil {
+		return nil, err
+	}
+
+	return frdrpc.NewFaradayServerClient(conn), nil
+}
+
+func (hn *HarnessNode) loopClient() (looprpc.SwapClientClient, error) {
+	mac, err := hn.ReadMacaroon(hn.Cfg.LoopMacPath, lntest.DefaultTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := hn.ConnectRPCWithMacaroon(mac)
+	if err != nil {
+		return nil, err
+	}
+
+	return looprpc.NewSwapClientClient(conn), nil
+}
+
+func (hn *HarnessNode) poolClient() (poolrpc.TraderClient, error) {
+	mac, err := hn.ReadMacaroon(hn.Cfg.PoolMacPath, lntest.DefaultTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := hn.ConnectRPCWithMacaroon(mac)
+	if err != nil {
+		return nil, err
+	}
+
+	return poolrpc.NewTraderClient(conn), nil
 }
 
 // waitForState waits until the current node state fulfills the given

@@ -50,6 +50,9 @@ type NetworkHarness struct {
 	// new blocks on the network.
 	Miner *rpctest.Harness
 
+	// server is an instance of the local Loop/Pool mock server.
+	server *serverHarness
+
 	// BackendCfg houses the information necessary to use a node as LND
 	// chain backend, such as rpc configuration, P2P information etc.
 	BackendCfg lntest.BackendConfig
@@ -125,20 +128,33 @@ func (n *NetworkHarness) SetUp(t *testing.T,
 	grpclog.SetLoggerV2(fakeLogger)
 	n.currentTestCase = testCase
 
+	// Start our mock Loop/Pool server first.
+	mockServerAddr := fmt.Sprintf(listenerFormat, lntest.NextAvailablePort())
+	n.server = newServerHarness(mockServerAddr)
+	err := n.server.start()
+	require.NoError(t, err)
+
+	litArgs := []string{
+		fmt.Sprintf("--loop.server.host=%s", mockServerAddr),
+		fmt.Sprintf("--loop.server.tlspath=%s", n.server.certFile),
+		fmt.Sprintf("--pool.auctionserver=%s", mockServerAddr),
+		fmt.Sprintf("--pool.tlspathauctserver=%s", n.server.certFile),
+	}
+
 	// Start the initial seeder nodes within the test network, then connect
 	// their respective RPC clients.
 	eg := errgroup.Group{}
 	eg.Go(func() error {
 		var err error
 		n.Alice, err = n.newNode(
-			"Alice", lndArgs, false, nil, true,
+			"Alice", lndArgs, litArgs, false, nil, true,
 		)
 		return err
 	})
 	eg.Go(func() error {
 		var err error
 		n.Bob, err = n.newNode(
-			"Bob", lndArgs, false, nil, true,
+			"Bob", lndArgs, litArgs, false, nil, true,
 		)
 		return err
 	})
@@ -251,7 +267,7 @@ func (n *NetworkHarness) Stop() {
 // wallet with or without a seed. If hasSeed is false, the returned harness node
 // can be used immediately. Otherwise, the node will require an additional
 // initialization phase where the wallet is either created or restored.
-func (n *NetworkHarness) newNode(name string, extraArgs []string,
+func (n *NetworkHarness) newNode(name string, extraArgs, litArgs []string,
 	hasSeed bool, password []byte, wait bool, opts ...NodeOption) (
 	*HarnessNode, error) {
 
@@ -263,6 +279,7 @@ func (n *NetworkHarness) newNode(name string, extraArgs []string,
 		BackendCfg:        n.BackendCfg,
 		NetParams:         n.netParams,
 		ExtraArgs:         extraArgs,
+		LitArgs:           litArgs,
 	}
 	for _, opt := range opts {
 		opt(cfg)
